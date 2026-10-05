@@ -2,12 +2,13 @@
 
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 import pooch
 import pytest
 
 import deepscenic as ds
-from deepscenic._datasets import TF_COLLECTION_CHECKSUMS, TF_COLLECTION_URLS
+from deepscenic._datasets import MM_LINES_FILES, TF_COLLECTION_CHECKSUMS, TF_COLLECTION_URLS, _read_tsv_matrix
 
 
 class TestFetchTFCollection:
@@ -230,3 +231,85 @@ class TestCacheManagement:
         deleted = ds.clear_cache()
 
         assert deleted == []
+
+
+class TestFetchMMLines:
+    """Tests for fetch_mm_lines function."""
+
+    @staticmethod
+    def _write_geo_files(tmp_path, rna_cells, atac_cells, meta_cells):
+        """Write small GEO-style files: RNA as cells x genes, ATAC as regions x cells."""
+        meta = pd.DataFrame(
+            {"MMline": ["MM001", "MM001", "MM099"], "lineState": ["MEL", "MEL", "MES"]}, index=meta_cells
+        )
+        rna = pd.DataFrame(
+            [[0.2 * i, 1.0, 0.0] for i in range(len(rna_cells))], index=rna_cells, columns=["SOX10", "MITF", "JUN"]
+        )
+        regions = ["chr1:100-600", "chr2:200-700"]
+        atac = pd.DataFrame(
+            [[float(int(c[1:])) + r for c in atac_cells] for r in range(len(regions))],
+            index=regions,
+            columns=atac_cells,
+        )
+        files = {}
+        for key, df in [("metadata", meta), ("rna", rna), ("atac", atac)]:
+            fname = MM_LINES_FILES[key][0]
+            df.to_csv(tmp_path / fname, sep="\t", compression="gzip")
+            files[fname] = str(tmp_path / fname)
+        return files
+
+    def test_files_have_checksums(self):
+        """Test that every MM_lines file has a SHA256 checksum."""
+        for fname, known_hash in MM_LINES_FILES.values():
+            assert fname.startswith("GSE210745_mm_lines_")
+            assert len(known_hash) == 64
+
+    @patch("pooch.retrieve")
+    def test_fetch_returns_aligned_data(self, mock_retrieve, tmp_path, monkeypatch):
+        """Test shapes, orientation and cell order of the returned objects."""
+        monkeypatch.setattr(pooch, "os_cache", lambda _: tmp_path)
+        files = self._write_geo_files(
+            tmp_path, rna_cells=["c1", "c0", "c2"], atac_cells=["c2", "c0", "c1"], meta_cells=["c0", "c1", "c2"]
+        )
+        mock_retrieve.side_effect = lambda **kwargs: files[kwargs["fname"]]
+
+        adata_rna, adata_atac, metadata = ds.fetch_mm_lines()
+
+        assert mock_retrieve.call_count == 3
+        assert list(metadata.columns) == ["MMline", "lineState"]
+        assert list(adata_rna.obs_names) == list(adata_atac.obs_names) == list(metadata.index) == ["c0", "c1", "c2"]
+        assert adata_rna.shape == (3, 3)
+        assert adata_atac.shape == (3, 2)
+        assert list(adata_atac.var_names) == ["chr1:100-600", "chr2:200-700"]
+        assert adata_atac.X.dtype == np.float32
+        # values follow their cells after reordering
+        np.testing.assert_allclose(adata_rna[:, "SOX10"].X.ravel(), [0.2, 0.0, 0.4], rtol=1e-6)
+        np.testing.assert_allclose(adata_atac.X[:, 1], [1.0, 2.0, 3.0])
+
+    @patch("pooch.retrieve")
+    def test_mismatched_cells_raises(self, mock_retrieve, tmp_path, monkeypatch):
+        """Test error when the files describe different cells."""
+        monkeypatch.setattr(pooch, "os_cache", lambda _: tmp_path)
+        files = self._write_geo_files(
+            tmp_path, rna_cells=["c0", "c1", "c2"], atac_cells=["c0", "c1", "c3"], meta_cells=["c0", "c1", "c2"]
+        )
+        mock_retrieve.side_effect = lambda **kwargs: files[kwargs["fname"]]
+
+        with pytest.raises(ValueError, match="Cell names differ"):
+            ds.fetch_mm_lines()
+
+    def test_read_tsv_matrix_chunked(self, tmp_path):
+        """Test that chunked reading matches a full read, with and without transposing."""
+        df = pd.DataFrame(
+            np.arange(35, dtype=float).reshape(7, 5), index=[f"r{i}" for i in range(7)], columns=list("abcde")
+        )
+        path = tmp_path / "matrix.tsv.gz"
+        df.to_csv(path, sep="\t", compression="gzip")
+
+        X, rows, cols = _read_tsv_matrix(str(path), chunksize=3)
+        np.testing.assert_array_equal(X, df.to_numpy())
+        assert list(rows) == list(df.index) and list(cols) == list(df.columns)
+
+        Xt, rows_t, cols_t = _read_tsv_matrix(str(path), transpose=True, chunksize=3)
+        np.testing.assert_array_equal(Xt, df.to_numpy().T)
+        assert list(rows_t) == list(df.columns) and list(cols_t) == list(df.index)

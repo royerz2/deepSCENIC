@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive documentation with 6 tutorial notebooks
 - MuData-based data structures for multimodal data
 - `ds.datasets` module for fetching TF lists and gene annotations
+- `ds.fetch_mm_lines()` to download the MM_lines tutorial dataset from GEO (GSE210745), so Tutorial 1 runs outside the VIB cluster
 - Schema validation with `ds.data.validate_schema()`
 - Sphinx documentation with sphinx-book-theme
 - ReadTheDocs integration with hatch/uv

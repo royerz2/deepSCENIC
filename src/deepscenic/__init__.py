@@ -22,6 +22,7 @@ from ._data import (
 from ._datasets import (
     clear_cache,
     fetch_gene_annotation,
+    fetch_mm_lines,
     fetch_tf_collection,
     get_cache_info,
 )
@@ -60,6 +61,7 @@ __all__ = [
     # Datasets
     "fetch_tf_collection",
     "fetch_gene_annotation",
+    "fetch_mm_lines",
     "clear_cache",
     "get_cache_info",
     # Genome

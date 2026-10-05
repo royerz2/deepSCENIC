@@ -9,11 +9,13 @@ import time
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 import pooch
 import requests
+from anndata import AnnData
 
-__all__ = ["fetch_tf_collection", "fetch_gene_annotation", "clear_cache", "get_cache_info"]
+__all__ = ["fetch_tf_collection", "fetch_gene_annotation", "fetch_mm_lines", "clear_cache", "get_cache_info"]
 
 log = logging.getLogger("deepscenic.datasets")
 _NCBI_MAX_RETRIES = 3
@@ -30,6 +32,23 @@ TF_COLLECTION_CHECKSUMS = {
     "human": "3953034f84112c60d3d8ef15b0e0c8ac5fce0b40d2c7c0824c2945c70cee2523",
     "mouse": "17a95e142147fb7dc063d7b9e84262746b0b64f622793b3cc5df0eddf2f1194c",
     "fly": "20d7e11540b595dda3ed133f86af559c9fc708810dc39d4bef106961fedf348d",
+}
+
+# MM_lines melanoma pseudo-multiome dataset (SCENIC+ paper, GEO GSE210745)
+MM_LINES_URL = "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE210nnn/GSE210745/suppl/"
+MM_LINES_FILES = {
+    "metadata": (
+        "GSE210745_mm_lines_cell_metadata.tsv.gz",
+        "f444800f5eba828277d4feb8e5af9b9157da2cb14fe6b1f7a529eed9f212ce81",
+    ),
+    "rna": (
+        "GSE210745_mm_lines_gene_expression_matrix.tsv.gz",
+        "8e0680e13bcddcf823e7020acc169f491c8f4d6e3bcd1fa8ecc9addc72127b96",
+    ),
+    "atac": (
+        "GSE210745_mm_lines_region_accessibility_matrix.tsv.gz",
+        "d0afdf29281e3c517ef96150860f8a8e659b828c675c6c6e3e15f692cf249c83",
+    ),
 }
 
 
@@ -408,6 +427,106 @@ def _fetch_chromsizes_and_filter(
         log.info("Converted chromosome names to UCSC style")
 
     return chromsizes, annot
+
+
+def fetch_mm_lines() -> tuple[AnnData, AnnData, pd.DataFrame]:
+    """
+    Fetch the MM_lines melanoma dataset used in the tutorials.
+
+    Downloads and caches the pseudo-multiome dataset of nine human melanoma cell
+    lines from the SCENIC+ paper (GEO GSE210745, ~95 MB). Each of the 936
+    pseudo-multiome cells averages the profiles of 5 cells from the same line,
+    spanning melanocytic (MEL), intermediate (INT) and mesenchymal-like (MES) states.
+
+    The downloaded files are cached; parsing them takes ~20 s and up to ~4 GB of memory.
+
+    Returns
+    -------
+    adata_rna
+        Gene expression, shape ``(936, 17085)``. Averaged raw counts, not normalized.
+    adata_atac
+        Region accessibility, shape ``(936, 288643)``, with ``chr:start-end`` region names.
+        These are averaged raw values, **not** the pycisTopic-imputed accessibility
+        recommended for training (see :func:`deepscenic.pp.create_mudata`).
+    metadata
+        Cell metadata with columns ``MMline`` (cell line) and ``lineState`` (MEL, INT, MES),
+        in the same cell order as ``adata_rna`` and ``adata_atac``.
+
+    Examples
+    --------
+    >>> import deepscenic as ds
+    >>> adata_rna, adata_atac, metadata = ds.fetch_mm_lines()
+    >>> adata_rna.shape, adata_atac.shape
+    ((936, 17085), (936, 288643))
+    >>> metadata["lineState"].value_counts().to_dict()
+    {'INT': 358, 'MEL': 318, 'MES': 260}
+    """
+    cache_dir = _get_cache_dir()
+    paths = {
+        key: pooch.retrieve(
+            url=MM_LINES_URL + fname,
+            known_hash=known_hash,
+            path=cache_dir,
+            fname=fname,
+            progressbar=True,
+        )
+        for key, (fname, known_hash) in MM_LINES_FILES.items()
+    }
+
+    metadata = pd.read_csv(paths["metadata"], sep="\t", index_col=0)
+    metadata.index = metadata.index.astype(str)
+    metadata.index.name = None
+
+    log.info("Reading MM_lines gene expression matrix...")
+    rna_X, rna_cells, genes = _read_tsv_matrix(paths["rna"])
+    # GEO stores accessibility as regions x cells
+    log.info("Reading MM_lines region accessibility matrix...")
+    atac_X, atac_cells, regions = _read_tsv_matrix(paths["atac"], transpose=True)
+
+    adata_rna = AnnData(X=rna_X, obs=pd.DataFrame(index=rna_cells), var=pd.DataFrame(index=genes))
+    adata_atac = AnnData(X=atac_X, obs=pd.DataFrame(index=atac_cells), var=pd.DataFrame(index=regions))
+
+    if not (set(adata_rna.obs_names) == set(adata_atac.obs_names) == set(metadata.index)):
+        raise ValueError("Cell names differ between the MM_lines expression, accessibility and metadata files.")
+    # reorder only if needed: copying the accessibility matrix costs ~1 GB
+    if not adata_rna.obs_names.equals(metadata.index):
+        adata_rna = adata_rna[metadata.index].copy()
+    if not adata_atac.obs_names.equals(metadata.index):
+        adata_atac = adata_atac[metadata.index].copy()
+
+    log.info(f"Loaded MM_lines: {adata_rna.n_obs} cells, {adata_rna.n_vars} genes, {adata_atac.n_vars} regions")
+    return adata_rna, adata_atac, metadata
+
+
+def _read_tsv_matrix(
+    path: str,
+    transpose: bool = False,
+    chunksize: int = 20_000,
+) -> tuple[np.ndarray, pd.Index, pd.Index]:
+    """
+    Read a gzipped TSV matrix (row names in the first column) as float32.
+
+    Reads in chunks so that large matrices never exist as float64 in memory.
+
+    Returns
+    -------
+    X
+        The matrix, transposed if ``transpose`` is True.
+    obs_names, var_names
+        Row and column names of ``X``.
+    """
+    blocks, row_names = [], []
+    col_names = pd.Index([])
+    for chunk in pd.read_csv(path, sep="\t", index_col=0, chunksize=chunksize):
+        col_names = chunk.columns.astype(str)
+        row_names.append(chunk.index.astype(str))
+        blocks.append(chunk.to_numpy(dtype=np.float32))
+
+    rows = pd.Index(np.concatenate(row_names))
+    if transpose:
+        X = np.hstack([block.T for block in blocks])
+        return X, col_names, rows
+    return np.vstack(blocks), rows, col_names
 
 
 def clear_cache(pattern: str | None = None) -> list[str]:

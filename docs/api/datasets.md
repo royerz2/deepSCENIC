@@ -1,6 +1,6 @@
 # Datasets
 
-Functions for fetching external data resources (TF collections, gene annotations).
+Functions for fetching external data resources (TF collections, gene annotations, example datasets).
 
 ## TF Collections
 
@@ -12,6 +12,12 @@ Functions for fetching external data resources (TF collections, gene annotations
 
 ```{eval-rst}
 .. autofunction:: deepscenic.fetch_gene_annotation
+```
+
+## Example Datasets
+
+```{eval-rst}
+.. autofunction:: deepscenic.fetch_mm_lines
 ```
 
 ## Cache Management
@@ -35,6 +41,9 @@ annot, chromsizes = ds.fetch_gene_annotation(
     species="mmusculus",
     biomart_host="http://nov2020.archive.ensembl.org/",
 )
+
+# Fetch the MM_lines melanoma dataset used in the tutorials (GEO GSE210745)
+adata_rna, adata_atac, metadata = ds.fetch_mm_lines()
 
 # Check cache status
 ds.get_cache_info()
