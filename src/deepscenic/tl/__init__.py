@@ -23,6 +23,7 @@ from ._model import (
     load_model,
 )
 from ._perturbation import (
+    perturbation_stability,
     process_perturbation_results,
     simulate_multi_perturbation,
     simulate_perturbation,
@@ -55,6 +56,7 @@ __all__ = [
     "simulate_perturbation",
     "simulate_multi_perturbation",
     "process_perturbation_results",
+    "perturbation_stability",
     # Sequence interpretation
     "ISMResult",
     "in_silico_mutagenesis",
