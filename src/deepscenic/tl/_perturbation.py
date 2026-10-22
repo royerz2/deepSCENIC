@@ -88,8 +88,9 @@ def simulate_perturbation(
     tol
         If given, stop once every cell's relative change per iteration,
         ``||x_k - x_{k-1}|| / ||x_k - x_0||`` over the non-perturbed genes, is
-        at most ``tol``. A warning is raised if some cells have not converged
-        after ``n_iter`` iterations.
+        at most ``tol``. A warning is raised if some perturbed cells (``support`` > 0,
+        see ``return_diagnostics``) have not converged after ``n_iter`` iterations;
+        cells where the TF already sits at the perturbation level are not counted.
     damping
         Step size ``a`` in ``(0, 1]``: ``x_k = (1 - a) x_{k-1} + a F(x_{k-1})``.
         ``a = 1`` is the original update. Damping does not change the fixed
@@ -192,6 +193,7 @@ def simulate_perturbation(
         free_genes[tf_gene_idx] = False
     diag_parts: dict[str, list[np.ndarray]] = {"converged": [], "n_iter": [], "rel_change": [], "support": []}
     n_not_converged = 0
+    n_perturbed = 0
 
     # Output arrays, allocated once the first batch shows their width and dtype
     outputs: dict[object, np.ndarray] = {}
@@ -232,7 +234,8 @@ def simulate_perturbation(
             for tf_gene_idx, perturbation_level in zip(tf_gene_indices, levels, strict=True):
                 perturbed_rna[:, tf_gene_idx] = perturbation_level
 
-            if return_diagnostics:
+            support = None
+            if return_diagnostics or tol is not None:
                 # Support: change in latent TF activity imposed by the clamp (the encoder acts per TF)
                 x_tfs = x_rna[:, model.vae.tf_indices]
                 x_tfs_level = x_tfs.clone()
@@ -241,7 +244,8 @@ def simulate_perturbation(
                 phi = model.vae.encoder(x_tfs, use_mean=True)[0]
                 phi_level = model.vae.encoder(x_tfs_level, use_mean=True)[0]
                 support = (phi[:, tf_indices] - phi_level[:, tf_indices]).abs().sum(dim=1)
-                diag_parts["support"].append(support.cpu().numpy())
+                if return_diagnostics:
+                    diag_parts["support"].append(support.cpu().numpy())
 
             n_batch = end_idx - i
             converged = torch.zeros(n_batch, dtype=torch.bool, device=device)
@@ -290,9 +294,12 @@ def simulate_perturbation(
                     size = (perturbed_rna - x_rna)[:, free_genes].norm(dim=1).clamp_min(1e-12)
                     rel_change = step / size
                     if tol is not None:
-                        newly = (rel_change <= tol) & ~converged
-                        iters_used[newly] = iter_num
-                        converged |= rel_change <= tol
+                        # Converged means "the last step was within tol", re-evaluated at every iteration: a cell
+                        # that dipped below tol earlier but is moving again is not converged.
+                        now = rel_change <= tol
+                        iters_used = torch.where(now & ~converged, torch.full_like(iters_used, iter_num), iters_used)
+                        iters_used = torch.where(~now, torch.full_like(iters_used, n_iter), iters_used)
+                        converged = now
                         if bool(converged.all()):
                             break
 
@@ -304,7 +311,10 @@ def simulate_perturbation(
                 _store("perturbed", rows, perturbed_rna.cpu().numpy())
                 _store("logFC", rows, logFC_decoded.cpu().numpy())
             if tol is not None:
-                n_not_converged += int((~converged).sum())
+                # Only cells that are actually perturbed (support > 0) count: where the TF already sits at the
+                # clamp level there is nothing to converge, and the relative change is rounding noise over noise.
+                n_not_converged += int((~converged & (support > 1e-6)).sum())
+                n_perturbed += int((support > 1e-6).sum())
             if return_diagnostics:
                 if tol is None:
                     converged = torch.zeros(n_batch, dtype=torch.bool, device=device)
@@ -318,7 +328,7 @@ def simulate_perturbation(
         return perturbed_trace, logFC_trace
     if n_not_converged:
         warnings.warn(
-            f"{n_not_converged} of {n_cells} cells did not converge within n_iter={n_iter} (tol={tol}). "
+            f"{n_not_converged} of {n_perturbed} perturbed cells did not converge within n_iter={n_iter} (tol={tol}). "
             "Their result depends on the iteration count; see perturbation_stability().",
             RuntimeWarning,
             stacklevel=2,
@@ -361,6 +371,33 @@ def simulate_multi_perturbation(
     )
 
 
+def _tf_update(
+    model: DeepSCENICModel,
+    x0: torch.Tensor,
+    z0: torch.Tensor,
+    g0: torch.Tensor | None,
+    y: torch.Tensor,
+    tf_cols: torch.Tensor,
+    mode: str,
+    clip_max: float,
+    clamped: list[int],
+    levels: list[float],
+) -> torch.Tensor:
+    """One application of the perturbation update, restricted to the TF coordinates ``y``.
+
+    Only TF expression feeds back into the encoder, so iterating this map on ``y`` (with the other genes held at
+    their measured values ``x0``) is the same iteration as :func:`simulate_perturbation`, restricted to TFs.
+    """
+    x = x0.clone()
+    x[:, tf_cols] = y
+    z = model.vae(x, model.adj_tf2r, use_mean=True, skip_atac=True).z_rna[:, tf_cols]
+    dec = model.vae.decoder_rna(z - z0) if mode == "legacy" else model.vae.decoder_rna(z) - g0
+    new = torch.clamp(x0[:, tf_cols] + dec, 0, clip_max)
+    for t, v in zip(clamped, levels, strict=True):
+        new[:, t] = v
+    return new
+
+
 def perturbation_stability(
     model: DeepSCENICModel,
     mdata: md.MuData,
@@ -370,7 +407,6 @@ def perturbation_stability(
     cells: np.ndarray | list[int] | None = None,
     mode: Literal["legacy", "counterfactual"] = "legacy",
     n_power: int = 60,
-    eps: float = 1e-3,
     batch_size: int = 64,
     device: str | torch.device | None = None,
     clip_percentile: float = 99.99,
@@ -390,9 +426,13 @@ def perturbation_stability(
 
     ``rho`` is estimated at each cell's measured state, with the TFs in
     ``tf_name`` (if any) clamped to ``level`` and excluded from the free
-    coordinates, by power iteration with finite-difference Jacobian-vector
-    products: ``rho ~ exp(mean_k log ||J v_k||)`` over the second half of
-    ``n_power`` normalised steps (Gelfand's formula).
+    coordinates, by power iteration with exact Jacobian-vector products
+    (forward-mode autograd): ``rho ~ exp(mean_k log ||J v_k||)`` over the second
+    half of ``n_power`` normalised steps (Gelfand's formula). The estimate
+    converges to ``rho`` as ``n_power`` grows; with a complex-conjugate leading
+    pair of eigenvalues it converges more slowly. Where the update is clipped, the
+    Jacobian is the one-sided autograd derivative (zero for values held at the
+    clip boundary).
 
     Parameters
     ----------
@@ -410,8 +450,6 @@ def perturbation_stability(
         Decoder mode, as in :func:`simulate_perturbation`.
     n_power
         Power-iteration steps.
-    eps
-        Finite-difference step for the Jacobian-vector products.
     batch_size
         Cells per batch.
     device
@@ -470,21 +508,14 @@ def perturbation_stability(
                 y0[:, t] = v
 
             def update(y: torch.Tensor, x0=x0, z0=z0, g0=g0) -> torch.Tensor:
-                x = x0.clone()
-                x[:, tf_cols] = y
-                z = model.vae(x, model.adj_tf2r, use_mean=True, skip_atac=True).z_rna[:, tf_cols]
-                dec = model.vae.decoder_rna(z - z0) if mode == "legacy" else model.vae.decoder_rna(z) - g0
-                new = torch.clamp(x0[:, tf_cols] + dec, 0, clip_max)
-                for t, v in zip(clamped, levels, strict=True):
-                    new[:, t] = v
-                return new
+                return _tf_update(model, x0, z0, g0, y, tf_cols, mode, clip_max, clamped, levels)
 
             vec = torch.randn(y0.shape, generator=generator).to(device)
             vec[:, clamped] = 0.0
             vec = vec / vec.norm(dim=1, keepdim=True)
             logs = []
             for _ in range(n_power):
-                jv = (update(y0 + eps * vec) - update(y0 - eps * vec)) / (2 * eps)
+                _, jv = torch.func.jvp(update, (y0,), (vec,))
                 jv[:, clamped] = 0.0
                 norm = jv.norm(dim=1, keepdim=True).clamp_min(1e-30)
                 logs.append(torch.log(norm[:, 0]))
